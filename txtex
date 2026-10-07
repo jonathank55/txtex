@@ -20,6 +20,7 @@ import argparse
 import datetime
 import shutil
 from pathlib import Path
+from typing import Optional, List, Dict, Any, Union
 
 # Optimi-Farbnorm
 BLUE_BOLD = "\033[1m\033[0;34m"
@@ -680,6 +681,167 @@ def extract_raw_text(file_path: str) -> str:
                 return res.stdout.strip()
             raise ValueError(f"Nicht unterstütztes Format: {ext}")
 
+SUPPORTED_EXTENSIONS = (
+    ".pdf", ".docx", ".doc", ".pptx", ".ppt",
+    ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp",
+    ".rtf", ".rtfd", ".html", ".htm", ".xhtml",
+    ".txt", ".md", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml", ".typ"
+)
+
+def clean_path_string(raw: str) -> str:
+    """Bereinigt Pfad-Strings von Anführungszeichen, URI-Schemata und Terminal-Escapes."""
+    if not raw:
+        return ""
+    s = raw.strip()
+    if s.startswith("file://"):
+        s = s[7:]
+        if s.startswith("localhost/"):
+            s = s[9:]
+        elif s.startswith("localhost"):
+            s = s[9:]
+        import urllib.parse
+        s = urllib.parse.unquote(s)
+    while (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+    s = s.replace(r"\ ", " ").replace(r"\(", "(").replace(r"\)", ")").replace(r"\[", "[").replace(r"\]", "]")
+    return s.strip()
+
+def resolve_single_path(raw_path: str) -> Optional[Path]:
+    """
+    Löst einen Dateipfad deterministisch über eine mehrstufige Suchkaskade auf:
+    1. Bereinigter Pfad absolut / relativ zum CWD
+    2. Expandierte Tilde (~) & Umgebungsvariablen
+    3. ~/Downloads/ Ordner
+    4. ~/Documents/ Ordner
+    5. Arbeitsbereichs-Wurzel
+    6. ~/Desktop/ Ordner
+    7. Automatische Endungserweiterung (.pdf, .docx, .pptx, .png, etc.)
+    8. Case-Insensitive Dateisuche
+    """
+    cleaned = clean_path_string(raw_path)
+    if not cleaned:
+        return None
+
+    candidate = Path(os.path.expandvars(os.path.expanduser(cleaned)))
+    if candidate.exists() and candidate.is_file():
+        return candidate.resolve()
+
+    search_dirs = [
+        Path.cwd(),
+        Path(DOWNLOADS_DIR),
+        Path.home() / "Downloads",
+        Path.home() / "Documents",
+        Path.home() / "Documents" / "AGY_OBSIDIAN_SYSTEMVERZEICHNIS",
+        Path.home() / "Desktop",
+    ]
+    seen_dirs = set()
+    unique_search_dirs = []
+    for d in search_dirs:
+        try:
+            resolved_d = d.resolve()
+            if resolved_d not in seen_dirs and resolved_d.exists():
+                seen_dirs.add(resolved_d)
+                unique_search_dirs.append(resolved_d)
+        except Exception:
+            continue
+
+    # 1. Direkte Suche in den Ordnern
+    for sdir in unique_search_dirs:
+        p = (sdir / cleaned).resolve()
+        if p.exists() and p.is_file():
+            return p
+
+    # 2. Suche mit automatischen Dateiendungen
+    has_ext = bool(candidate.suffix)
+    if not has_ext:
+        for sdir in unique_search_dirs:
+            for ext in SUPPORTED_EXTENSIONS:
+                p = (sdir / f"{cleaned}{ext}").resolve()
+                if p.exists() and p.is_file():
+                    return p
+
+    # 3. Case-Insensitive Suche in den Ordnern
+    target_name = Path(cleaned).name.lower()
+    for sdir in unique_search_dirs:
+        try:
+            for entry in sdir.iterdir():
+                if entry.is_file():
+                    if entry.name.lower() == target_name:
+                        return entry.resolve()
+                    if not has_ext and any(entry.name.lower() == f"{target_name}{ext}" for ext in SUPPORTED_EXTENSIONS):
+                        return entry.resolve()
+        except (PermissionError, OSError):
+            continue
+
+    return None
+
+def resolve_input_files(raw_files: list) -> list:
+    """
+    Löst eine Liste von CLI-Dateiargumenten auf und fasst unquotierte Pfadsegmente
+    mit Leerzeichen intelligent zusammen.
+    """
+    if not raw_files:
+        return []
+
+    # Prüfe zuerst, ob alle Argumente zusammengefügt eine existierende Datei ergeben
+    joined_all = " ".join(raw_files)
+    single_res = resolve_single_path(joined_all)
+    if single_res:
+        return [single_res]
+
+    resolved_paths = []
+    i = 0
+    n = len(raw_files)
+    while i < n:
+        matched = False
+        for j in range(n, i, -1):
+            sub_str = " ".join(raw_files[i:j])
+            p = resolve_single_path(sub_str)
+            if p:
+                resolved_paths.append(p)
+                i = j
+                matched = True
+                break
+        if not matched:
+            p = resolve_single_path(raw_files[i])
+            if p:
+                resolved_paths.append(p)
+            else:
+                resolved_paths.append(Path(clean_path_string(raw_files[i])))
+            i += 1
+
+    return resolved_paths
+
+def normalize_cli_args(raw_args: list) -> list:
+    """Normalisiert CLI-Argumente für flexible Parameterübergabe."""
+    flags_with_vals = []
+    positional_tokens = []
+    i = 0
+    n = len(raw_args)
+    while i < n:
+        a = raw_args[i]
+        if a in ("-o", "--output"):
+            flags_with_vals.append(a)
+            if i + 1 < n:
+                flags_with_vals.append(raw_args[i + 1])
+                i += 2
+                continue
+            i += 1
+            continue
+        elif a in ("-h", "-d", "-s", "-r", "-j", "--help"):
+            flags_with_vals.append(a)
+            i += 1
+            continue
+        elif a.startswith("-"):
+            flags_with_vals.append(a)
+            i += 1
+            continue
+        else:
+            positional_tokens.append(a)
+            i += 1
+
+    return flags_with_vals + positional_tokens
+
 # ==============================================================================
 # 3. CLI & Hauptablauf
 # ==============================================================================
@@ -692,25 +854,38 @@ def main():
         add_help=False
     )
     parser.add_argument("-h", action="help", help="Hilfe anzeigen")
-    parser.add_argument("files", metavar="DATEI", nargs="+", help="Pfad(e) zu Quell-Dateien (.pdf, .docx, Bilder, .pptx, .rtf, .html, .txt)")
+    parser.add_argument("files", metavar="DATEI", nargs="*", help="Pfad(e) zu Quell-Dateien (.pdf, .docx, Bilder, .pptx, .rtf, .html, .txt)")
     parser.add_argument("-o", metavar="AUSGABE", dest="output", help="Spezifischer Zieldateipfad (.txt)")
     parser.add_argument("-d", action="store_true", dest="downloads", help="Im Downloads-Ordner als .txt ablegen (Standard)")
     parser.add_argument("-s", action="store_true", dest="stdout", help="Direkte Textausgabe auf stdout ohne Speichern")
     parser.add_argument("-r", action="store_true", dest="raw", help="Rohtext ohne typografische Normalisierung ausgeben")
     parser.add_argument("-j", action="store_true", dest="json", help="Ausgabe von Metadaten als JSON (Pfad, Zeichen, Wörter, Zeilen)")
 
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
 
+    normalized_args = normalize_cli_args(sys.argv[1:])
+    args = parser.parse_args(normalized_args)
 
-    args = parser.parse_args()
+    if not args.files:
+        parser.print_help()
+        sys.exit(0)
+
+    resolved_paths = resolve_input_files(args.files)
+    unresolved = [p for p in resolved_paths if not p.exists()]
+    if unresolved:
+        print(f"\n{BLUE_BOLD}=== txtex: Universelle Textextraktion & Normalisierung ==={RESET}", file=sys.stderr)
+        print(LINE_SEP, file=sys.stderr)
+        for p in unresolved:
+            print(f"{RED}✗ FEHLER:{RESET} Datei nicht gefunden: {p}", file=sys.stderr)
+            print(f"{BOLD}Hinweis:{RESET} Automatische Suche in Arbeitsverzeichnis, Downloads und Dokumente ohne Treffer.", file=sys.stderr)
+        print(LINE_SEP, file=sys.stderr)
+        sys.exit(1)
 
     results = []
 
-    for file_str in args.files:
-        p = Path(file_str).expanduser().resolve()
-        if not p.exists():
-            print(f"{RED}✗ FEHLER:{RESET} Datei nicht gefunden: {p}", file=sys.stderr)
-            sys.exit(1)
-
+    for p in resolved_paths:
         try:
             raw_text = extract_raw_text(str(p))
             if args.raw:
@@ -765,3 +940,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
