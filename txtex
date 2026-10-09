@@ -731,7 +731,7 @@ def resolve_single_path(raw_path: str) -> Optional[Path]:
         Path(DOWNLOADS_DIR),
         Path.home() / "Downloads",
         Path.home() / "Documents",
-        Path.home() / "Documents" / "AGY_OBSIDIAN_SYSTEMVERZEICHNIS",
+        Path.home() / "Documents" / "KI-Ordner",
         Path.home() / "Desktop",
     ]
     seen_dirs = set()
